@@ -8,16 +8,24 @@ from pypdf import PdfReader
 import pyperclip # Descomentado
 import httpx
 import mss # Para capturas de pantalla
-from PIL import Image # Para procesar la imagen capturada
+from PIL import Image, ImageDraw # Para procesar la imagen capturada y crear el icono
 import io # Para manejar streams de bytes (para la imagen)
 import base64 # Para codificar la imagen para la API
 # import keyboard # Comentado temporalmente
 import signal # Para manejar Ctrl+C
 import sys # Para sys.exit
 from pynput import mouse # Para escuchar clics del mouse globales
+import pystray # Para el icono en la bandeja del sistema
 
 # Bandera global para controlar la ejecución de hilos
 app_running = True
+# Evento para sincronizar el inicio de Tkinter
+tkinter_ready_event = threading.Event()
+
+# Variable global para el estado del color del texto
+text_color_is_black = True 
+# Variable global para el estado del monitoreo del portapapeles
+clipboard_monitoring_active = True
 
 # --- Variables Globales para Selección de Área ---
 selection_coords = []
@@ -26,26 +34,49 @@ selecting_area = False # Bandera para indicar si estamos en modo selección
 
 # --- Configuración ---
 PDF_DIRECTORY = "pdfs"
-PROMPT_INSTRUCTIONS = """
-Tu única tarea es identificar la alternativa correcta para la pregunta de opción múltiple dada, basándote EXCLUSIVAMENTE en el material de estudio adjunto, tu conocimiento general si no está en el material, o la imagen adjunta si se proporciona.
-Si se adjunta una imagen, tu respuesta DEBE basarse principalmente en la imagen.
-RESPONDE CON LA ALTERNATIVA CORRECTA, incluyendo la letra y las primeras palabras de esa alternativa (ej: "a) El proceso de...", "b) Se refiere a..."). Mantenlo muy breve. NO incluyas explicaciones ni texto innecesario. NO uses puntos suspensivos (...) al final, solo el texto inicial.
+# Márgenes globales para el posicionamiento de la ventana
+MARGIN_PERCENT_X = 0.01  # 1% de margen desde el borde derecho
+MARGIN_PERCENT_Y = 0.01  # 1% de margen desde el borde inferior
 
-Material de estudio adjunto (si aplica):
+PROMPT_INSTRUCTIONS = """
+Tu tarea principal es responder la pregunta proporcionada de la manera más precisa y concisa posible.
+
+Considera los siguientes tipos de pregunta:
+
+1. PREGUNTA CON OPCIONES MÚLTIPLES EXPLÍCITAS (ej: con a), b), c)):
+   - Identifica la alternativa correcta.
+   - RESPONDE ÚNICAMENTE con la letra de la alternativa y el texto completo de esa alternativa (ej: "a) El proceso de transformación digital.", "b) Se refiere a la capacidad de adaptación.").
+
+2. PREGUNTA DIRECTA O DE CONOCIMIENTO (que busca una única respuesta fáctica, sin opciones explícitas en la pregunta):
+   - Proporciona la respuesta correcta y concisa.
+   - FORMATEA ESTA RESPUESTA COMO SI FUERA LA PRIMERA ALTERNATIVA, utilizando "a)" seguido de la respuesta (ej: si la pregunta es "¿Color del cielo?", responde "a) Azul").
+
+3. PREGUNTA PARA COMPLETAR LA ORACIÓN (ej: "El sol sale por el ____."):
+   - Proporciona la palabra o frase corta que completa correctamente la oración.
+   - RESPONDE ÚNICAMENTE con esa palabra o frase corta (ej: "este").
+
+En todos los casos, DEBES proporcionar una respuesta y seguir ESTRICTAMENTE este orden de prioridad para la información:
+1. EXCLUSIVAMENTE el material de estudio adjunto (PDFs).
+2. Si se proporciona una imagen, basa tu respuesta PRINCIPALMENTE en la imagen, complementada por el material de estudio.
+3. Solo como ÚLTIMO RECURSO, si la información no está en el material ni en la imagen, usa tu conocimiento general.
+
+NO INCLUYAS EXPLICACIONES, saludos, ni ningún otro texto adicional. Solo la respuesta directa según el tipo de pregunta y formato especificado.
+
+Material de estudio adjunto (PDFs):
 ---
 {pdf_context}
 ---
 
-Pregunta y alternativas del usuario (y posible imagen adjunta):
+Pregunta del usuario (y posible imagen adjunta):
 ---
 {user_question}
 ---
 
-RESPUESTA (letra y primeras palabras, sin puntos suspensivos):
+RESPUESTA (según el tipo de pregunta, ver instrucciones arriba):
 """
 POLL_INTERVAL_SECONDS = 1 # Segundos entre chequeos del portapapeles
-WINDOW_WIDTH = 200 # Un poco más ancho para el botón
-WINDOW_HEIGHT = 60 # Un poco más alto para el botón
+WINDOW_WIDTH = 200 # Ancho de la ventana
+WINDOW_HEIGHT = 50 # Alto de la ventana (reducido al quitar el botón)
 # SCREENSHOT_HOTKEY = "ctrl+alt+s" # Comentado temporalmente
 
 # --- Carga de Clave API ---
@@ -65,6 +96,36 @@ except Exception as e_httpx:
     client = OpenAI(api_key=API_KEY) # Fallback a la original si la nueva falla por otra razón
 
 # --- Funciones ---
+
+def force_window_to_bottom_right_corner(window_obj):
+    """Fuerza la ventana a la esquina inferior derecha y la mantiene encima, intentándolo dos veces."""
+    if not (window_obj and window_obj.winfo_exists()):
+        return
+
+    screen_width = window_obj.winfo_screenwidth()
+    screen_height = window_obj.winfo_screenheight()
+
+    margin_x_pixels = int(screen_width * MARGIN_PERCENT_X)
+    margin_y_pixels = int(screen_height * MARGIN_PERCENT_Y)
+
+    x = screen_width - WINDOW_WIDTH - margin_x_pixels
+    y = screen_height - WINDOW_HEIGHT - margin_y_pixels
+    
+    new_geometry = f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x}+{y}"
+    
+    # Primer intento
+    window_obj.geometry(new_geometry)
+    window_obj.attributes("-topmost", True)
+    
+    # Forzar procesamiento de eventos pendientes de Tkinter
+    window_obj.update_idletasks()
+    
+    # Segundo intento para asegurar la posición y el estado topmost
+    window_obj.geometry(new_geometry) # Reaplicar geometría
+    window_obj.attributes("-topmost", True) # Reafirmar topmost
+    
+    window_obj.last_known_geometry = new_geometry # Actualizar con la posición forzada
+    # print(f"Ventana forzada (doble intento) a: {new_geometry}") # Para depuración
 
 def extract_text_from_pdfs(directory):
     """Extrae texto de todos los archivos PDF en el directorio especificado."""
@@ -152,7 +213,7 @@ def get_openai_answer(question, context, image_base64=None): # Modificado para a
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=messages_payload,
-            temperature=0.2,
+            temperature=0.0, # Temperatura bajada para respuestas más deterministas
             max_tokens=250
         )
         answer = response.choices[0].message.content.strip()
@@ -169,17 +230,8 @@ def setup_answer_window():
     root = tk.Tk()
     root.title("Respuesta")
     
-    # Calcular posición inferior derecha, muy cerca del borde inferior
-    X_OFFSET = 20 # Píxeles de margen desde el borde derecho
-    Y_OFFSET = 10 # Píxeles de margen desde el borde inferior (MUY PEQUEÑO = muy abajo)
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = screen_width - WINDOW_WIDTH - X_OFFSET
-    y = screen_height - WINDOW_HEIGHT - Y_OFFSET
-    
-    initial_geometry = f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x}+{y}"
-    root.geometry(initial_geometry) # Posición ajustada
-    root.last_known_geometry = initial_geometry # Guardar la geometría
+    # Posicionamiento inicial forzado a la esquina
+    force_window_to_bottom_right_corner(root) 
 
     root.overrideredirect(True) # Sin bordes ni título
     root.attributes("-topmost", True) # Siempre encima
@@ -189,112 +241,25 @@ def setup_answer_window():
     default_bg = root.cget('bg') # Obtener color de fondo por defecto
     root.attributes('-transparentcolor', default_bg)
 
-    # Etiqueta para mostrar la respuesta, con fondo transparente
-    answer_label = tk.Label(root, text="Esperando...", font=("Arial", 10),
-                            wraplength=WINDOW_WIDTH-10, bg=default_bg, fg="white")
-    answer_label.pack(expand=True, fill="both", padx=5, pady=2) # Menos pady para botón
-
-    # --- Botón para iniciar selección de área ---
-    def start_area_selection_mode():
-        global selecting_area, selection_coords, mouse_listener, global_answer_window_root
-        
-        if selecting_area:
-            print("Ya se está en modo de selección.")
-            return
-
-        print("Modo Selección de Área: Activado. Haz clic para la primera esquina.")
-        global_answer_window_root.update_label("Clic 1ª esquina") # Actualizar GUI
-        
-        selecting_area = True
-        selection_coords = []
-        
-        # Ocultar ventana principal para no interferir con los clics de selección
-        if global_answer_window_root:
-            global_answer_window_root.withdraw()
-
-        # Iniciar listener de mouse
-        # Usaremos un listener que se detiene después de 2 clics.
-        def on_click(x, y, button, pressed):
-            global selection_coords, selecting_area, mouse_listener, global_answer_window_root, global_pdf_text_context
-            if pressed and selecting_area and button == mouse.Button.left:
-                selection_coords.append((x, y))
-                print(f"Clic detectado en: ({x}, {y})")
-                
-                if len(selection_coords) == 1:
-                    print("Primera esquina registrada. Haz clic para la segunda esquina.")
-                    # No podemos actualizar la GUI directamente aquí porque está oculta y esto es un hilo diferente
-                    # El feedback será por consola.
-                    # Si tuviéramos una pequeña ventana de feedback separada, la actualizaríamos.
-                
-                elif len(selection_coords) == 2:
-                    print("Segunda esquina registrada. Procesando área seleccionada...")
-                    selecting_area = False # Salir del modo selección
-                    
-                    # Detener el listener
-                    if mouse_listener:
-                        mouse_listener.stop()
-                    
-                    # Mostrar ventana principal de nuevo y restaurar geometría
-                    if global_answer_window_root:
-                        global_answer_window_root.deiconify()
-                        if hasattr(global_answer_window_root, 'last_known_geometry'):
-                            global_answer_window_root.geometry(global_answer_window_root.last_known_geometry)
-                        global_answer_window_root.update_label("Procesando área...")
-
-                    # Calcular coordenadas para mss (left, top, width, height)
-                    x1, y1 = selection_coords[0]
-                    x2, y2 = selection_coords[1]
-                    
-                    region = {
-                        "top": min(y1, y2),
-                        "left": min(x1, x2),
-                        "width": abs(x1 - x2),
-                        "height": abs(y1 - y2)
-                    }
-                    
-                    # Asegurarse que width y height no sean cero
-                    if region["width"] == 0 or region["height"] == 0:
-                        print("Error: El área seleccionada tiene ancho o alto cero. Inténtalo de nuevo.")
-                        if global_answer_window_root and global_answer_window_root.winfo_exists():
-                            global_answer_window_root.update_label("Error: Área 0")
-                        selection_coords = [] # Resetear para nuevo intento
-                        # No reiniciamos selecting_area aquí, el usuario debe presionar el botón de nuevo.
-                        return False # Detener procesamiento del listener para este clic.
-
-                    print(f"Región calculada para mss: {region}")
-                    # Lanzar el procesamiento de esta región en un hilo
-                    threading.Thread(target=process_selected_area, args=(region, global_pdf_text_context, global_answer_window_root), daemon=True).start()
-                    return False # Detener el listener después del segundo clic válido
-            return True # Continuar escuchando si no es un clic relevante o no estamos listos
-
-        # Crear y empezar el listener en el hilo actual (que es el hilo de Tkinter para el botón)
-        # pynput.mouse.Listener se ejecuta en su propio hilo demonio por defecto.
-        mouse_listener = mouse.Listener(on_click=on_click)
-        mouse_listener.start()
-        print("Listener de mouse iniciado.")
-
-    capture_button = tk.Button(root, text="Seleccionar Área", command=start_area_selection_mode, font=("Arial", 8))
-    capture_button.pack(pady=(0,5))
+    # Etiqueta para mostrar la respuesta, con fondo transparente y texto negro
+    answer_label = tk.Label(root, text="Esperando...", font=("Arial", 10, "normal"),
+                            wraplength=WINDOW_WIDTH-10, bg=default_bg, fg="black") # fg cambiado a "black", peso de fuente especificado
+    answer_label.pack(expand=True, fill="both", padx=5, pady=5) # pady ajustado
+    root.answer_label = answer_label # Hacer la etiqueta accesible desde root
 
     # --- Función para cerrar la ventana y la app ---
-    def quit_app(event=None): # event=None para poder llamarla desde Ctrl+C y Escape
+    # Modificada para integrarse con pystray
+    def quit_app_tk_part(): # Solo la parte de Tkinter
         global app_running
-        print("Cerrando aplicación...")
-        app_running = False # Indicar a otros hilos que deben detenerse si es posible
-        try:
-            # Detener el listener de keyboard si estuviera activo (no en esta versión simplificada)
-            # if keyboard_listener_active: # Necesitaríamos una bandera para esto
-            #     keyboard.unhook_all() # O el método específico de la librería si es diferente
-            #     print("Listeners de teclado detenidos.")
-            pass # No hay listener de teclado activo en esta versión simplificada
-        except Exception as e_kb_stop:
-            print(f"Error al intentar detener listeners de teclado: {e_kb_stop}")
+        print("Cerrando parte de Tkinter...")
+        app_running = False # Indicar a otros hilos que deben detenerse
         
-        root.quit() # Termina el bucle principal de Tkinter
-        root.destroy() # Destruye la ventana
-        # sys.exit(0) # Forzar salida, aunque root.quit() debería ser suficiente si no hay más hilos no demonio
-
-    root.bind("<Escape>", quit_app) # Vincular tecla Escape para cerrar
+        if root and root.winfo_exists():
+            root.quit() # Termina el bucle principal de Tkinter
+            root.destroy() # Destruye la ventana
+        
+    root.protocol("WM_DELETE_WINDOW", lambda: quit_app_combined(None)) # Manejar cierre de ventana
+    root.bind("<Escape>", lambda event: quit_app_combined(None)) # Vincular tecla Escape para cerrar
 
     # Hacer la ventana arrastrable
     last_click_x = 0
@@ -316,12 +281,184 @@ def setup_answer_window():
 
     # Función para actualizar el texto (segura para hilos)
     def update_label(text):
-        answer_label.config(text=text)
+        if root and root.winfo_exists(): # Asegurarse de que la ventana exista
+            answer_label.config(text=text)
 
     root.update_label = update_label # Adjuntar función para acceso externo
     return root
 
-def check_clipboard(pdf_context, root): # DESCOMENTADA COMPLETAMENTE
+# --- Funciones relacionadas con pystray y manejo de la aplicación ---
+tray_icon = None # Variable global para el icono de la bandeja
+
+def toggle_clipboard_monitoring_action():
+    """Alterna el estado de monitoreo del portapapeles (activo/pausado)."""
+    global clipboard_monitoring_active, tray_icon
+    clipboard_monitoring_active = not clipboard_monitoring_active
+    status = "activado" if clipboard_monitoring_active else "pausado"
+    print(f"Monitoreo del portapapeles {status}.")
+    # Si el icono existe y el menú se puede actualizar (pystray lo hace si el texto del item es una función)
+    if tray_icon:
+        pass # El texto del menú se actualizará automáticamente si es una función lambda
+
+def toggle_text_color_action():
+    """Alterna el color del texto de la etiqueta de respuesta entre negro y blanco."""
+    global text_color_is_black, global_answer_window_root
+
+    text_color_is_black = not text_color_is_black
+    new_color = "black" if text_color_is_black else "white"
+
+    if global_answer_window_root and global_answer_window_root.winfo_exists() and hasattr(global_answer_window_root, 'answer_label'):
+        global_answer_window_root.after(0, lambda: global_answer_window_root.answer_label.config(fg=new_color))
+        print(f"Color del texto cambiado a: {new_color}")
+    else:
+        print("No se pudo cambiar el color del texto: la ventana o la etiqueta no están disponibles.")
+
+def create_icon_image():
+    """Crea una imagen simple para el icono de la bandeja."""
+    width = 64
+    height = 64
+    # Fondo transparente, color del icono blanco/gris
+    color_bg = (0, 0, 0, 0)  # Transparente
+    color_icon = (200, 200, 200, 255) # Gris claro para el icono
+    image = Image.new('RGBA', (width, height), color_bg)
+    dc = ImageDraw.Draw(image)
+    # Dibujar una forma simple (un círculo con un punto)
+    dc.ellipse([(width*0.1, height*0.1), (width*0.9, height*0.9)], fill=color_icon)
+    dc.ellipse([(width*0.4, height*0.4), (width*0.6, height*0.6)], fill=color_bg) # Punto central transparente
+    return image
+
+def start_area_selection_mode_thread_safe():
+    """Inicia la selección de área de forma segura para hilos (llamada desde pystray)."""
+    global selecting_area, selection_coords, mouse_listener, global_answer_window_root
+    
+    if selecting_area:
+        print("Ya se está en modo de selección.")
+        if global_answer_window_root and global_answer_window_root.winfo_exists():
+            global_answer_window_root.after(0, global_answer_window_root.update_label, "Selección activa")
+        return
+
+    print("Modo Selección de Área: Activado. Haz clic para la primera esquina.")
+    if global_answer_window_root and global_answer_window_root.winfo_exists():
+        global_answer_window_root.after(0, global_answer_window_root.update_label, "Clic 1ª esquina")
+    
+    selecting_area = True
+    selection_coords = []
+    
+    if global_answer_window_root and global_answer_window_root.winfo_exists():
+        global_answer_window_root.after(0, global_answer_window_root.withdraw) # Ocultar ventana
+
+    def on_click(x, y, button, pressed):
+        global selection_coords, selecting_area, mouse_listener, global_answer_window_root, global_pdf_text_context
+        if pressed and selecting_area and button == mouse.Button.left:
+            selection_coords.append((x, y))
+            print(f"Clic detectado en: ({x}, {y})")
+            
+            if len(selection_coords) == 1:
+                print("Primera esquina registrada. Haz clic para la segunda esquina.")
+            
+            elif len(selection_coords) == 2:
+                print("Segunda esquina registrada. Procesando área seleccionada...")
+                selecting_area = False
+                
+                if mouse_listener:
+                    mouse_listener.stop()
+                
+                if global_answer_window_root and global_answer_window_root.winfo_exists():
+                    # Mostrar la ventana y luego forzar posición y topmost
+                    def show_and_force_position():
+                        if not (global_answer_window_root and global_answer_window_root.winfo_exists()): return
+                        global_answer_window_root.deiconify()
+                        # Forzar posición después de un breve retardo para asegurar que deiconify se complete
+                        global_answer_window_root.after(20, lambda: force_window_to_bottom_right_corner(global_answer_window_root))
+                        global_answer_window_root.update_label("Procesando área...") # Actualizar etiqueta después de deiconify
+                    
+                    global_answer_window_root.after(0, show_and_force_position)
+
+                x1, y1 = selection_coords[0]
+                x2, y2 = selection_coords[1]
+                
+                region = {
+                    "top": min(y1, y2), "left": min(x1, x2),
+                    "width": abs(x1 - x2), "height": abs(y1 - y2)
+                }
+                
+                if region["width"] == 0 or region["height"] == 0:
+                    print("Error: El área seleccionada tiene ancho o alto cero.")
+                    if global_answer_window_root and global_answer_window_root.winfo_exists():
+                        global_answer_window_root.after(0, global_answer_window_root.update_label, "Error: Área 0")
+                    selection_coords = []
+                    return False
+
+                print(f"Región calculada para mss: {region}")
+                threading.Thread(target=process_selected_area, args=(region, global_pdf_text_context, global_answer_window_root), daemon=True).start()
+                return False # Detener listener
+        return True
+
+    mouse_listener = mouse.Listener(on_click=on_click)
+    mouse_listener.start()
+    print("Listener de mouse iniciado para selección de área.")
+
+def toggle_window_visibility():
+    """Muestra u oculta la ventana de respuesta."""
+    if global_answer_window_root and global_answer_window_root.winfo_exists():
+        if global_answer_window_root.state() == 'withdrawn':
+            global_answer_window_root.deiconify() # Mostrar primero
+            # Luego, forzar posición y topmost con un pequeño retardo
+            global_answer_window_root.after(20, lambda: force_window_to_bottom_right_corner(global_answer_window_root))
+            print("Ventana de respuesta mostrada y reposicionada.")
+        else:
+            global_answer_window_root.withdraw()
+            print("Ventana de respuesta oculta.")
+    else:
+        print("La ventana de respuesta no está disponible para mostrar/ocultar.")
+
+
+def quit_app_combined(icon_param=None, tk_root_param=None):
+    global app_running, tray_icon, global_answer_window_root
+    
+    if not app_running: # Evitar múltiples llamadas
+        return
+        
+    print("Cerrando aplicación (combinado)...")
+    app_running = False
+
+    # Detener el listener de mouse si está activo
+    global mouse_listener
+    if mouse_listener and mouse_listener.is_alive():
+        print("Deteniendo listener de mouse...")
+        mouse_listener.stop()
+
+    # Detener el icono de la bandeja
+    # El icono que se pasa puede ser el que se usa en el menú o el global
+    actual_icon = icon_param if icon_param else tray_icon
+    if actual_icon:
+        print("Deteniendo icono de la bandeja...")
+        actual_icon.stop()
+    
+    # Detener Tkinter
+    actual_tk_root = tk_root_param if tk_root_param else global_answer_window_root
+    if actual_tk_root and actual_tk_root.winfo_exists():
+        print("Cerrando ventana de Tkinter...")
+        # La función quit_app_tk_part ya se encarga de root.quit y root.destroy
+        # Pero necesitamos asegurarnos de que se llame desde el hilo correcto
+        actual_tk_root.after(0, actual_tk_root.destroy) # Destruir es más directo aquí
+        # Esperar un poco a que se procese la destrucción de Tkinter
+        # Esto es delicado; idealmente, el hilo de Tkinter se uniría.
+        # Como es un hilo demonio, sys.exit() lo terminará.
+    
+    print("Saliendo del script...")
+    # sys.exit(0) no siempre es necesario si pystray.stop() libera el hilo principal
+    # y los hilos demonio se cierran. Pero para asegurar...
+    # Damos un pequeño tiempo para que los hilos terminen
+    # time.sleep(0.5) # Pequeña pausa
+    # Forzar la salida si los hilos no terminan limpiamente es la última opción
+    # ya que sys.exit() puede ser abrupto para hilos demonio.
+    # pystray.Icon.stop() debería permitir que el hilo principal continúe y termine.
+    # Si pystray está en el hilo principal, su .stop() debería hacer que .run() retorne.
+
+# --- Fin de funciones pystray ---
+
+def check_clipboard(pdf_context, root):
     """Verifica el portapapeles y procesa nuevo texto."""
     print("Iniciando monitoreo del portapapeles...")
     global app_running # Usar la bandera global
@@ -337,6 +474,15 @@ def check_clipboard(pdf_context, root): # DESCOMENTADA COMPLETAMENTE
 
     while app_running: # Verificar la bandera global
         try:
+            if not clipboard_monitoring_active:
+                time.sleep(POLL_INTERVAL_SECONDS) # Ahorrar CPU, pero seguir comprobando app_running
+                continue # Saltar el procesamiento del portapapeles si está pausado
+
+            # Verificar si la ventana raíz de Tkinter todavía existe antes de intentar actualizarla
+            if root and not root.winfo_exists():
+                print("Ventana de Tkinter no disponible, deteniendo monitoreo de portapapeles en este hilo.")
+                break # Salir del bucle si la ventana ya no existe
+
             current_value = pyperclip.paste()
             if current_value != recent_value and current_value.strip():
                 print("\n--- Nuevo texto detectado en portapapeles ---")
@@ -352,7 +498,11 @@ def check_clipboard(pdf_context, root): # DESCOMENTADA COMPLETAMENTE
                     if root and root.winfo_exists():
                         root.after(0, root.update_label, display_text)
 
-                threading.Thread(target=get_and_show_answer_clipboard, daemon=True).start()
+                # Asegurarse de que app_running no haya cambiado antes de iniciar nuevo hilo
+                if app_running:
+                    threading.Thread(target=get_and_show_answer_clipboard, daemon=True).start()
+                else:
+                    print("app_running es False, no se inicia hilo para respuesta de portapapeles.")
 
         except pyperclip.PyperclipException:
             # Errores de acceso al portapapeles (ej. "could not open clipboard") pueden ser frecuentes
@@ -370,8 +520,9 @@ def process_selected_area(region_details, pdf_context_for_area, root_window):
     """Toma captura de una región específica, la procesa y obtiene respuesta de OpenAI."""
     print(f"\n--- Procesando área seleccionada: {region_details} ---")
     
-    question_for_image = "Analiza esta imagen y describe su contenido."
-    print(f"Usando pregunta fija para la imagen: '{question_for_image}'")
+    # Pregunta para la imagen, adaptada para ambos tipos de pregunta
+    question_for_image = "Esta imagen contiene una pregunta (puede ser de opción múltiple o para completar). Analiza la imagen y, utilizando también el material de estudio adjunto, proporciona la respuesta correcta y concisa. Si es de opción múltiple, responde con la letra y las primeras palabras de la alternativa. Si es para completar, responde solo con la palabra o frase corta que completa la oración."
+    print(f"Usando pregunta para la imagen: '{question_for_image}'")
 
     if root_window and root_window.winfo_exists():
         root_window.after(0, root_window.update_label, "Capturando área...")
@@ -395,11 +546,9 @@ def process_selected_area(region_details, pdf_context_for_area, root_window):
                 def update_and_reapply_geometry():
                     if not root_window.winfo_exists(): return # Comprobación extra
                     root_window.update_label(display_text)
-                    if hasattr(root_window, 'last_known_geometry'):
-                        # print(f"Reaplicando geometría después de respuesta: {root_window.last_known_geometry}") # Para depurar
-                        root_window.geometry(root_window.last_known_geometry)
-                    else:
-                        print("Advertencia: last_known_geometry no encontrada al intentar reaplicar después de respuesta.")
+                    
+                    # Forzar la posición y topmost después de actualizar la etiqueta (primer intento)
+                    force_window_to_bottom_right_corner(root_window)
                 
                 root_window.after(0, update_and_reapply_geometry)
         
@@ -433,36 +582,43 @@ def take_screenshot_region(region_dict):
 # Variables globales para pasar a la callback del botón (simplificación temporal)
 global_pdf_text_context = None
 global_answer_window_root = None
+# tray_icon ya está definido arriba
 
 # --- Manejador de Señal para Ctrl+C ---
 def signal_handler(sig, frame):
     print('\nCtrl+C detectado! Intentando cerrar la aplicación...')
-    global app_running
-    app_running = False # Indicar a otros hilos/procesos que se detengan
+    quit_app_combined() # Usar la función combinada
 
-    if global_answer_window_root and hasattr(global_answer_window_root, 'quit_app_ref'):
-        print("Signal handler: Intentando llamar a la función de cierre de la GUI (quit_app_ref)...")
-        try:
-            # Llamar a la función que contiene root.quit() y root.destroy()
-            # Esto es potencialmente inseguro si se llama desde un hilo que no es el principal de Tkinter,
-            # pero dado que after_idle no funcionó, es un intento más directo.
-            global_answer_window_root.quit_app_ref()
-            # Damos una pequeña oportunidad para que el evento de quit se procese
-            # Esto es heurístico y no una solución garantizada para problemas de hilos.
-            print("Signal handler: quit_app_ref llamada. Esperando brevemente antes de forzar salida si es necesario.")
-            # No se puede hacer un time.sleep() largo aquí porque estamos en un manejador de señales.
-            # El objetivo es que root.quit() termine el mainloop.
-        except Exception as e:
-            print(f"Signal handler: Error al llamar a quit_app_ref: {e}")
-            print("Signal handler: Recurriendo a sys.exit(1) debido a error.")
-            sys.exit(1) # Salir con código de error si la llamada a quit_app_ref falla
-    else:
-        print("Signal handler: No hay referencia a la GUI (global_answer_window_root) o a quit_app_ref.")
+# --- Funciones para ejecutar Tkinter en un hilo ---
+def run_tkinter_app():
+    global global_answer_window_root, global_pdf_text_context
+    
+    print("Configurando ventana de respuesta en hilo de Tkinter...")
+    answer_window = setup_answer_window()
+    global_answer_window_root = answer_window
+    
+    # Adjuntar referencia a quit_app_combined para ser llamada desde Tkinter (e.g. Escape)
+    # El lambda necesita acceso al icono de la bandeja, que se crea después.
+    # Por ahora, pasamos None y quit_app_combined usará la variable global tray_icon.
+    global_answer_window_root.quit_app_ref = lambda: quit_app_combined(None, global_answer_window_root)
+    
+    # Iniciar monitoreo del portapapeles después de que la ventana esté lista
+    # y pasar la referencia correcta de la ventana
+    if app_running: # Solo si la app sigue corriendo
+        clipboard_thread = threading.Thread(target=check_clipboard, args=(global_pdf_text_context, global_answer_window_root), daemon=True)
+        clipboard_thread.start()
+        print("Hilo de monitoreo de portapapeles iniciado desde hilo de Tkinter.")
 
-    # Si root.quit() fue llamado por quit_app_ref, mainloop debería terminar.
-    # Si el programa sigue aquí, o si no se pudo llamar a quit_app_ref, forzamos la salida.
-    print("Signal handler: Forzando salida con sys.exit(0) como último recurso.")
-    sys.exit(0)
+    tkinter_ready_event.set() # Indicar que Tkinter está listo
+    print("Iniciando bucle principal de Tkinter (mainloop)...")
+    try:
+        answer_window.mainloop()
+    except Exception as e_mainloop:
+        print(f"Error durante mainloop de Tkinter: {e_mainloop}")
+    finally:
+        print("Bucle principal de Tkinter finalizado.")
+        # Asegurarse de que si mainloop termina (p.ej. por error), la app se cierre.
+        # quit_app_combined() # Esto podría causar problemas si ya se está cerrando.
 
 # --- Ejecución Principal ---
 if __name__ == "__main__":
@@ -475,43 +631,69 @@ if __name__ == "__main__":
     if not pdf_text_context:
         print("Advertencia: No se pudo cargar texto de los PDFs. El asistente podría no tener contexto de clase.")
     
-    print("Configurando ventana de respuesta...")
-    answer_window_root = setup_answer_window()
-    global_answer_window_root = answer_window_root # Asignar a la variable global
+    # Iniciar Tkinter en un hilo separado
+    tkinter_thread = threading.Thread(target=run_tkinter_app, daemon=True)
+    tkinter_thread.start()
     
-    answer_window_root.quit_app_ref = lambda: quit_app(None)
+    print("Esperando a que la GUI de Tkinter esté lista...")
+    tkinter_ready_event.wait() # Esperar a que la ventana de Tkinter esté configurada
+    print("GUI de Tkinter lista.")
 
-    # Iniciar el monitoreo del portapapeles en un hilo separado (DESCOMENTADO)
-    clipboard_thread = threading.Thread(target=check_clipboard, args=(pdf_text_context, answer_window_root), daemon=True)
-    clipboard_thread.start()
+    if not global_answer_window_root:
+        print("Error: La ventana de Tkinter no se inicializó correctamente. Saliendo.")
+        sys.exit(1)
 
-    # Configurar el atajo de teclado para la captura de pantalla (SIGUE COMENTADO)
-    # try:
-    #     def hotkey_callback_wrapper():
-    #         print("hotkey_callback_wrapper: Atajo presionado, iniciando procesamiento...")
-    #         try:
-    #             process_screenshot_request(pdf_text_context, answer_window_root)
-    #         except Exception as e_wrapper:
-    #             print(f"Error catastrófico en hotkey_callback_wrapper: {e_wrapper}")
-    #             import traceback
-    #             traceback.print_exc()
-    #             if answer_window_root and answer_window_root.winfo_exists():
-    #                 try:
-    #                     answer_window_root.after(0, answer_window_root.update_label, "Error atajo fatal")
-    #                 except Exception as e_gui_fatal:
-    #                     print(f"Error al intentar mostrar error fatal en GUI: {e_gui_fatal}")
-    #         print("hotkey_callback_wrapper: Procesamiento del atajo finalizado.")
+    # Configurar y ejecutar el icono de la bandeja del sistema en el hilo principal
+    icon_image = create_icon_image()
+    
+    # Crear los items del menú
+    # El primer item con default=True es usualmente la acción para el clic izquierdo.
+    menu_items = [
+        pystray.MenuItem(
+            'Seleccionar Área',
+            start_area_selection_mode_thread_safe,
+            default=True, # Marcar como acción por defecto
+            visible=True # Asegurar que sea visible en el menú de clic derecho también
+        ),
+        pystray.MenuItem('Mostrar/Ocultar Ventana', toggle_window_visibility),
+        pystray.MenuItem(
+            # Aceptar un argumento opcional (item) que pystray podría pasar al generar el texto del menú
+            lambda item=None: "Pausar Monitoreo Portapapeles" if clipboard_monitoring_active else "Reanudar Monitoreo Portapapeles",
+            toggle_clipboard_monitoring_action
+        ),
+        pystray.MenuItem('Alternar Color Texto', toggle_text_color_action),
+        pystray.MenuItem('Salir', lambda: quit_app_combined(tray_icon, global_answer_window_root))
+    ]
+    menu = pystray.Menu(*menu_items) # Crear una instancia de pystray.Menu
 
-    #     keyboard.add_hotkey(SCREENSHOT_HOTKEY, hotkey_callback_wrapper)
-    #     print(f"Atajo de teclado '{SCREENSHOT_HOTKEY}' registrado para capturar pantalla.")
-    #     print("NOTA: La detección de atajos puede requerir que la consola tenga foco o ejecutar como administrador.")
-    # except Exception as e:
-    #     print(f"Error al registrar el atajo de teclado '{SCREENSHOT_HOTKEY}': {e}")
-    #     print("Asegúrate de que la librería 'keyboard' esté instalada y, en Windows, prueba ejecutar como administrador.")
+    # La acción principal (seleccionar área) se activa por el MenuItem con default=True.
+    # Las otras acciones quedan en el menú de clic derecho.
+    tray_icon = pystray.Icon(
+        "AsistenteGPT", 
+        icon_image, 
+        "Asistente GPT - Clic Izq: Sel. Área", # El tooltip puede seguir así
+        menu # Pasar la instancia de pystray.Menu
+    )
 
-    # print("Iniciando interfaz gráfica. Copia texto o usa el atajo para capturas.") # Mensaje modificado
-    print("Iniciando interfaz gráfica. Usa el botón para capturar pantalla. Presiona ESC para salir.")
-    answer_window_root.mainloop()
-
-    # Después de que mainloop termina (por root.quit())
+    print("Iniciando icono en la bandeja del sistema. La aplicación está en ejecución.")
+    # Mensaje actualizado para reflejar el comportamiento del clic izquierdo y derecho
+    print("Haz clic izquierdo en el icono para Seleccionar Área. Clic derecho para más opciones (Mostrar/Ocultar Ventana, Salir). Presiona ESC en la ventana (si está visible) o usa Ctrl+C para salir.")
+    
+    try:
+        tray_icon.run() # Esto es bloqueante y se ejecutará en el hilo principal
+    except Exception as e_tray:
+        print(f"Error durante la ejecución del icono de la bandeja: {e_tray}")
+    finally:
+        print("Ejecución del icono de la bandeja finalizada.")
+        # Asegurar que todo se cierre si tray_icon.run() termina por alguna razón
+        # (aparte de quit_app_combined siendo llamada)
+        if app_running: # Si no se cerró por quit_app_combined
+            quit_app_combined(tray_icon, global_answer_window_root)
+        
+        # Esperar a que el hilo de Tkinter termine si es necesario (aunque es demonio)
+        if tkinter_thread.is_alive():
+            print("Esperando al hilo de Tkinter...")
+            # No se puede hacer join a un hilo demonio de esta forma fácilmente si sys.exit() se llama.
+            # La lógica de cierre debería haber manejado la GUI.
+        
     print("Script finalizado limpiamente.") 
