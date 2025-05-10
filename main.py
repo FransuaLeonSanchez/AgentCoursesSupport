@@ -26,6 +26,8 @@ tkinter_ready_event = threading.Event()
 text_color_is_black = True 
 # Variable global para el estado del monitoreo del portapapeles
 clipboard_monitoring_active = True
+# Variable global para la última respuesta copiada por la app al portapapeles
+last_copied_by_app = None 
 
 # --- Variables Globales para Selección de Área ---
 selection_coords = []
@@ -53,7 +55,7 @@ Considera los siguientes tipos de pregunta:
 
 3. PREGUNTA PARA COMPLETAR LA ORACIÓN (ej: "El sol sale por el ____."):
    - Proporciona la palabra o frase corta que completa correctamente la oración.
-   - RESPONDE ÚNICAMENTE con esa palabra o frase corta (ej: "este").
+
 
 En todos los casos, DEBES proporcionar una respuesta y seguir ESTRICTAMENTE este orden de prioridad para la información:
 1. EXCLUSIVAMENTE el material de estudio adjunto (PDFs).
@@ -461,7 +463,7 @@ def quit_app_combined(icon_param=None, tk_root_param=None):
 def check_clipboard(pdf_context, root):
     """Verifica el portapapeles y procesa nuevo texto."""
     print("Iniciando monitoreo del portapapeles...")
-    global app_running # Usar la bandera global
+    global app_running, clipboard_monitoring_active, last_copied_by_app
     recent_value = ""
     try:
         # Intentar obtener el valor inicial sin fallar si no está disponible
@@ -478,35 +480,52 @@ def check_clipboard(pdf_context, root):
                 time.sleep(POLL_INTERVAL_SECONDS) # Ahorrar CPU, pero seguir comprobando app_running
                 continue # Saltar el procesamiento del portapapeles si está pausado
 
-            # Verificar si la ventana raíz de Tkinter todavía existe antes de intentar actualizarla
             if root and not root.winfo_exists():
                 print("Ventana de Tkinter no disponible, deteniendo monitoreo de portapapeles en este hilo.")
-                break # Salir del bucle si la ventana ya no existe
+                break 
 
             current_value = pyperclip.paste()
             if current_value != recent_value and current_value.strip():
-                print("\n--- Nuevo texto detectado en portapapeles ---")
-                print(f"Texto copiado: '{current_value[:100]}...'")
-                recent_value = current_value
-
-                if root and root.winfo_exists():
-                    root.after(0, root.update_label, "Procesando texto...")
-
-                def get_and_show_answer_clipboard():
-                    answer = get_openai_answer(recent_value, pdf_context) # Sin imagen para el portapapeles
-                    display_text = answer[:16] + "..." + answer[-13:] if len(answer) > 27 else answer
-                    if root and root.winfo_exists():
-                        root.after(0, root.update_label, display_text)
-
-                # Asegurarse de que app_running no haya cambiado antes de iniciar nuevo hilo
-                if app_running:
-                    threading.Thread(target=get_and_show_answer_clipboard, daemon=True).start()
+                if current_value == last_copied_by_app:
+                    print("Ignorando el texto del portapapeles ya que fue copiado por la aplicación.")
+                    recent_value = current_value # Actualizar recent_value para evitar reprocesar si no hay más cambios
                 else:
-                    print("app_running es False, no se inicia hilo para respuesta de portapapeles.")
+                    # Es un nuevo texto genuino del usuario/otra app
+                    print("\n--- Nuevo texto detectado en portapapeles ---")
+                    print(f"Texto copiado: '{current_value[:100]}...'")
+                    
+                    # Guardar el valor actual como el que se está procesando
+                    text_to_process = current_value 
+                    # Actualizar recent_value para la próxima comparación
+                    recent_value = current_value 
+                    # Resetear la bandera, ya que este texto no fue puesto por nuestra app
+                    last_copied_by_app = None 
 
+                    if root and root.winfo_exists():
+                        root.after(0, root.update_label, "Procesando texto...")
+
+                    # Definir y lanzar el hilo SOLO si es un nuevo texto genuino
+                    def process_clipboard_in_thread(text_for_openai):
+                        global last_copied_by_app # Necesario para actualizarla desde el hilo
+                        
+                        answer = get_openai_answer(text_for_openai, pdf_context)
+                        display_text = answer[:16] + "..." + answer[-13:] if len(answer) > 27 else answer
+                        
+                        if root and root.winfo_exists():
+                            root.after(0, root.update_label, display_text)
+                        
+                        try:
+                            pyperclip.copy(answer)
+                            print(f"Respuesta completa copiada al portapapeles: '{answer[:50]}...'" if len(answer) > 50 else f"Respuesta completa copiada al portapapeles: '{answer}'")
+                            last_copied_by_app = answer # Guardar lo que la app copió
+                        except pyperclip.PyperclipException as e_copy:
+                            print(f"Error al copiar la respuesta al portapapeles: {e_copy}")
+                            last_copied_by_app = None # Resetear si falla la copia
+
+                    if app_running: # Asegurarse de que app_running no haya cambiado antes de iniciar nuevo hilo
+                        threading.Thread(target=process_clipboard_in_thread, args=(text_to_process,), daemon=True).start()
+            
         except pyperclip.PyperclipException:
-            # Errores de acceso al portapapeles (ej. "could not open clipboard") pueden ser frecuentes
-            # si otra aplicación lo está usando intensivamente. Silenciarlos para no llenar la consola.
             pass 
         except Exception as e:
             print(f"Error inesperado en el bucle de monitoreo del portapapeles: {e}")
@@ -539,8 +558,18 @@ def process_selected_area(region_details, pdf_context_for_area, root_window):
         print("process_selected_area: Imagen codificada. Preparando para enviar a OpenAI.")
         
         def get_and_show_answer_area():
+            global last_copied_by_app
             answer = get_openai_answer(question_for_image, pdf_context_for_area, image_base64=image_b64)
             display_text = answer[:16] + "..." + answer[-13:] if len(answer) > 27 else answer
+            
+            try:
+                pyperclip.copy(answer)
+                print(f"Respuesta completa de área copiada al portapapeles: '{answer[:50]}...'" if len(answer) > 50 else f"Respuesta completa de área copiada al portapapeles: '{answer}'")
+                last_copied_by_app = answer # Guardar lo que la app copió
+            except pyperclip.PyperclipException as e_copy:
+                print(f"Error al copiar la respuesta de área al portapapeles: {e_copy}")
+                last_copied_by_app = None # Resetear si falla la copia
+
             if root_window and root_window.winfo_exists():
                 # Función para actualizar etiqueta y luego reaplicar geometría
                 def update_and_reapply_geometry():
