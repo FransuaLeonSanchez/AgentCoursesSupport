@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pypdf import PdfReader
 import pyperclip
+import httpx
 
 # --- Configuración ---
 PDF_DIRECTORY = "pdfs"
@@ -35,8 +36,15 @@ API_KEY = os.getenv("OPENAI_API_KEY")
 if not API_KEY:
     raise ValueError("No se encontró la variable de entorno OPENAI_API_KEY. Asegúrate de que esté en el archivo .env")
 
-# Volver a la inicialización simple de OpenAI
-client = OpenAI(api_key=API_KEY)
+# Inicializar OpenAI con un cliente httpx personalizado
+# Esto puede ayudar a evitar problemas con la configuración de proxies del entorno.
+try:
+    custom_httpx_client = httpx.Client(trust_env=False)
+    client = OpenAI(api_key=API_KEY, http_client=custom_httpx_client)
+except Exception as e_httpx:
+    print(f"Error al inicializar OpenAI con httpx.Client(trust_env=False): {e_httpx}")
+    print("Intentando inicialización simple de OpenAI (puede fallar si el problema de proxy persiste)...")
+    client = OpenAI(api_key=API_KEY) # Fallback a la original si la nueva falla por otra razón
 
 # --- Funciones ---
 
