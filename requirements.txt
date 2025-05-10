@@ -1,4 +1,9 @@
 openai==1.30.1
 python-dotenv==1.0.1
 pypdf==4.2.0
-pyperclip==1.8.2 
+pyperclip==1.8.2
+httpx
+mss==10.0.0
+Pillow==11.2.1
+keyboard==0.13.5
+pynput 
